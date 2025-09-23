@@ -13,6 +13,7 @@ ping_client: ping_client.c mip.h
 ping_server: ping_server.c mip.h
 	$(CC) $(CFLAGS) -o ping_server ping_server.c
 
-clean: rm -f mipd ping_client ping_server *.o *.socket
+clean:
+	rm -f mipd ping_client ping_server *.o *.socket
 
 .PHONY: all clean
