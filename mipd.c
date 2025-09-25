@@ -21,9 +21,21 @@ struct client_info {
     int active;
 };
 
+// Structure to track message routing
+struct message_route {
+    int from_fd;
+    int to_fd;
+    uint8_t dest_addr;
+    int active;
+};
+
 // Array to store client information
 static struct client_info clients[MAX_EVENTS];
 static int num_clients = 0;
+
+// Array to track message routes for proper response routing
+static struct message_route routes[MAX_EVENTS];
+static int num_routes = 0;
 
 // Add a new client to the tracking array
 static void add_client(int fd, uint8_t mip_addr) {
@@ -33,6 +45,36 @@ static void add_client(int fd, uint8_t mip_addr) {
         clients[num_clients].active = 1;
         num_clients++;
     }
+}
+
+// Add a route to track message flow
+static void add_route(int from_fd, int to_fd, uint8_t dest_addr) {
+    // Remove any existing route from this sender
+    for (int i = 0; i < num_routes; i++) {
+        if (routes[i].from_fd == from_fd) {
+            routes[i].active = 0;
+            break;
+        }
+    }
+    
+    // Add new route
+    if (num_routes < MAX_EVENTS) {
+        routes[num_routes].from_fd = from_fd;
+        routes[num_routes].to_fd = to_fd;
+        routes[num_routes].dest_addr = dest_addr;
+        routes[num_routes].active = 1;
+        num_routes++;
+    }
+}
+
+// Find who should receive a response from this sender
+static int find_response_destination(int sender_fd) {
+    for (int i = 0; i < num_routes; i++) {
+        if (routes[i].active && routes[i].to_fd == sender_fd) {
+            return routes[i].from_fd;
+        }
+    }
+    return -1;
 }
 
 // Remove a client from the tracking array
@@ -48,6 +90,13 @@ static void remove_client(int fd) {
             break;
         }
     }
+    
+    // Also remove any routes involving this client
+    for (int i = 0; i < num_routes; i++) {
+        if (routes[i].from_fd == fd || routes[i].to_fd == fd) {
+            routes[i].active = 0;
+        }
+    }
 }
 
 // Find client socket by MIP address
@@ -58,6 +107,11 @@ static int find_client_by_addr(uint8_t mip_addr) {
         }
     }
     return -1; // Not found
+}
+
+// Check if message is a response (PONG)
+static int is_response_message(const char* message) {
+    return strncmp(message, "PONG:", 5) == 0;
 }
 
 static int create_raw_socket(void) {
@@ -181,44 +235,96 @@ static void handle_unix_socket(int fd, int unix_sock, int debug, int epollfd, ui
 
         // MESSAGE FORWARDING LOGIC
         uint8_t dest_addr = (uint8_t)buf[0];
+        char* message = buf + 1;
         
-        // Find the destination client
-        int dest_fd = find_client_by_addr(dest_addr);
+        if (debug) {
+            printf("Processing message: %s\n", message);
+        }
         
-        if (dest_fd != -1 && dest_fd != fd) {
-            // Forward message to destination client
-            // Format: [source_addr][message]
-            char forward_buf[256];
-            
-            // Find source address (the fd that sent this message)
-            uint8_t src_addr = daemon_addr; // Default fallback
-            for (int i = 0; i < num_clients; i++) {
-                if (clients[i].fd == fd && clients[i].active) {
-                    src_addr = clients[i].mip_addr;
-                    break;
-                }
+        // Check if this is a response message
+        if (is_response_message(message)) {
+            // This is a response - route it back to the original sender
+            int response_dest = find_response_destination(fd);
+            if (debug) {
+                printf("This is a PONG message, looking for original sender of fd %d\n", fd);
+                printf("Found response destination: %d\n", response_dest);
             }
             
-            forward_buf[0] = src_addr;
-            memcpy(forward_buf + 1, buf + 1, rc - 1);
-            
-            int write_rc = write(dest_fd, forward_buf, rc);
-            if (write_rc < 0) {
-                perror("write to destination client");
-                if (debug) {
-                    printf("Failed to forward message to client %d\n", dest_fd);
+            if (response_dest != -1) {
+                // Forward response to original sender
+                char forward_buf[256];
+                
+                // Find source address (the fd that sent this response)
+                uint8_t src_addr = daemon_addr;
+                for (int i = 0; i < num_clients; i++) {
+                    if (clients[i].fd == fd && clients[i].active) {
+                        src_addr = clients[i].mip_addr;
+                        break;
+                    }
+                }
+                
+                forward_buf[0] = src_addr;
+                memcpy(forward_buf + 1, buf + 1, rc - 1);
+                
+                int write_rc = write(response_dest, forward_buf, rc);
+                if (write_rc < 0) {
+                    perror("write response to original sender");
+                } else {
+                    if (debug) {
+                        printf("Forwarded response from client %d to original sender %d\n", fd, response_dest);
+                    }
                 }
             } else {
                 if (debug) {
-                    printf("Forwarded message from client %d to client %d\n", fd, dest_fd);
+                    printf("No original sender found for response from client %d\n", fd);
                 }
             }
         } else {
+            // This is an original request - find destination and track the route
+            int dest_fd = find_client_by_addr(dest_addr);
+            
             if (debug) {
-                if (dest_fd == -1) {
-                    printf("No client found for destination address %d\n", dest_addr);
-                } else if (dest_fd == fd) {
-                    printf("Client trying to send to itself\n");
+                printf("This is a request message, dest_fd = %d\n", dest_fd);
+            }
+            
+            if (dest_fd != -1 && dest_fd != fd) {
+                // Track this route for response routing
+                add_route(fd, dest_fd, dest_addr);
+                
+                if (debug) {
+                    printf("Added route: from_fd=%d to_fd=%d\n", fd, dest_fd);
+                }
+                
+                // Forward message to destination client
+                char forward_buf[256];
+                
+                // Find source address
+                uint8_t src_addr = daemon_addr;
+                for (int i = 0; i < num_clients; i++) {
+                    if (clients[i].fd == fd && clients[i].active) {
+                        src_addr = clients[i].mip_addr;
+                        break;
+                    }
+                }
+                
+                forward_buf[0] = src_addr;
+                memcpy(forward_buf + 1, buf + 1, rc - 1);
+                
+                int write_rc = write(dest_fd, forward_buf, rc);
+                if (write_rc < 0) {
+                    perror("write to destination client");
+                } else {
+                    if (debug) {
+                        printf("Forwarded request from client %d to client %d\n", fd, dest_fd);
+                    }
+                }
+            } else {
+                if (debug) {
+                    if (dest_fd == -1) {
+                        printf("No client found for destination address %d\n", dest_addr);
+                    } else if (dest_fd == fd) {
+                        printf("Client trying to send to itself\n");
+                    }
                 }
             }
         }
