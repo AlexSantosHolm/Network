@@ -1,3 +1,4 @@
+#include <stdint.h>
 #define _GNU_SOURCE
 #include <arpa/inet.h> // Added for htons
 #include <linux/if_ether.h>
@@ -12,6 +13,47 @@
 #include <unistd.h>
 
 #include "mip.h"
+
+struct client_info {
+  int fd;
+  uint8_t mip_addr;
+  int active;
+};
+
+static struct client_info clients[MAX_EVENTS];
+static int num_clients = 0;
+
+static void add_client(int fd, uint8_t mip_addr) {
+  if (num_clients < MAX_EVENTS) {
+    clients[num_clients].fd = fd;
+    clients[num_clients].mip_addr = mip_addr;
+    clients[num_clients].active = 1;
+    num_clients++;
+  }
+}
+
+static void remove_client(int fd) {
+  for (int i = 0; i < num_clients; i++) {
+    if (clients[i].fd == fd) {
+      clients[i].active = 0;
+      // Shift the remaining clients down
+      for (int j = i; j < num_clients - 1; j++) {
+        clients[j] = clients[j + 1];
+      }
+      num_clients--;
+      break;
+    }
+  }
+}
+
+static int find_client_by_addr(uint8_t mip_addr) {
+  for (int i = 0; i < num_clients; i++) {
+    if (clients[i].active && clients[i].mip_addr == mip_addr) {
+      return clients[i].fd;
+    }
+  }
+  return -1; // Not found
+}
 
 static int create_raw_socket(void) {
   int sd;
@@ -90,8 +132,7 @@ static void handle_raw_socket(int fd, int debug) {
   }
 }
 
-static void handle_unix_socket(int fd, int unix_sock, int debug,
-                               int epollfd) { // Added epollfd parameter
+static void handle_unix_socket(int fd, int unix_sock, int debug, int epollfd, uint8_t daemon_addr) { // Added epollfd parameter
   char buf[256];
   int rc, client_fd;
   struct epoll_event ev;
@@ -106,6 +147,8 @@ static void handle_unix_socket(int fd, int unix_sock, int debug,
     if (debug) {
       printf("New client connected %d\n", client_fd);
     }
+
+    add_client(client_fd, daemon_addr);
 
     // ADD NEW CLIENT TO EPOLL
     if (add_to_epoll(epollfd, &ev, client_fd) == -1) {
@@ -130,6 +173,45 @@ static void handle_unix_socket(int fd, int unix_sock, int debug,
     if (debug) {
       printf("Received from client %d: %d bytes\n", fd, rc); // Fixed typo
       printf("Dest addr: %d, Message: %s\n", (uint8_t)buf[0], buf + 1);
+    }
+
+    uint8_t dest_addr = (uint8_t)buf[0];
+
+    int dest_fd = find_client_by_addr(dest_addr);
+    if (dest_fd != -1 && dest_fd != fd) {
+      // Forwarding format: [source_addr][message]
+      char forward_buf[256];
+
+      uint8_t src_addr = daemon_addr; //Default fallback
+      for (int i = 0; i < num_clients; i++) {
+        if (clients[i].fd == fd && clients[i].active) {
+          src_addr = clients[i].mip_addr;
+          break;
+        }
+      }
+
+      forward_buf[0] = src_addr;
+      memcpy(forward_buf + 1, buf + 1, rc - 1);
+
+      int write_rc = write(dest_fd, forward_buf, rc);
+      if (write_rc < 0) {
+        perror("Write to destination");
+        if (debug) {
+          printf("Failed to forward message to client %d\n", dest_fd);
+        }
+      } else {
+        if (debug) {
+          printf("Forwarded message from client %d to client %d\n", fd, dest_fd);
+       }
+      }
+    } else {
+      if (debug) {
+        if (dest_addr == -1) {
+          printf("No client found for forwarding destination address %d\n", dest_addr);
+        } else if (dest_fd == -1) {
+          printf("Client trying to send to itself");
+        }
+      }
     }
   }
 }
