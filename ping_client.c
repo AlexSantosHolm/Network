@@ -68,7 +68,7 @@ void run_ping_client(const char *socket_path, const char *message,
 
   // SEND PING
   gettimeofday(&start, NULL);
-  alarm(1);
+  alarm(5);
 
   rc = write(sock_fd, send_buf, 1 + strlen(ping_msg));
   if (rc < 0) {
