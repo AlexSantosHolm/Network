@@ -61,6 +61,10 @@ struct client_info {
 static struct client_info clients[MAX_EVENTS];
 static int num_clients = 0;
 
+// Forward declaration of send_mip_packet
+static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr, uint8_t src_mip_addr,
+                          const char* payload, int payload_len, int debug);
+
 // Initialize ARP cache
 static void init_arp_cache(void) {
     memset(arp_cache, 0, sizeof(arp_cache));
@@ -211,10 +215,6 @@ static int create_raw_socket(const char *if_name) {
 
     return sd;
 }
-
-// Forward declaration
-static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr, uint8_t src_mip_addr,
-                          const char* payload, int payload_len, int debug);
 
 // Send MIP-ARP request
 static void send_arp_request(int raw_sock, uint8_t target_mip_addr, uint8_t my_mip_addr, int debug) {
