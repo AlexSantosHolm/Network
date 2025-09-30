@@ -28,6 +28,20 @@ struct arp_cache_entry {
 #define ARP_CACHE_SIZE 256
 static struct arp_cache_entry arp_cache[ARP_CACHE_SIZE];
 
+// Pending packet structure
+struct pending_packet {
+    uint8_t dst_mip_addr;
+    uint8_t src_mip_addr;
+    char payload[256];
+    int payload_len;
+    time_t timestamp;
+    int valid;
+};
+
+// Pending packets waiting for ARP resolution
+#define PENDING_QUEUE_SIZE 32
+static struct pending_packet pending_queue[PENDING_QUEUE_SIZE];
+
 // Network interface info
 struct interface_info {
     char name[IFNAMSIZ];
@@ -50,6 +64,46 @@ static int num_clients = 0;
 // Initialize ARP cache
 static void init_arp_cache(void) {
     memset(arp_cache, 0, sizeof(arp_cache));
+}
+
+// Initialize pending queue
+static void init_pending_queue(void) {
+    memset(pending_queue, 0, sizeof(pending_queue));
+}
+
+// Add packet to pending queue
+static void add_pending_packet(uint8_t dst_mip_addr, uint8_t src_mip_addr,
+                              const char* payload, int payload_len) {
+    for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
+        if (!pending_queue[i].valid) {
+            pending_queue[i].dst_mip_addr = dst_mip_addr;
+            pending_queue[i].src_mip_addr = src_mip_addr;
+            memcpy(pending_queue[i].payload, payload, payload_len);
+            pending_queue[i].payload_len = payload_len;
+            pending_queue[i].timestamp = time(NULL);
+            pending_queue[i].valid = 1;
+            break;
+        }
+    }
+}
+
+// Process pending packets for a specific destination
+static void process_pending_packets(int raw_sock, uint8_t mip_addr, int debug) {
+    for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
+        if (pending_queue[i].valid && pending_queue[i].dst_mip_addr == mip_addr) {
+            // Try to send the packet
+            if (send_mip_packet(raw_sock, pending_queue[i].dst_mip_addr,
+                              pending_queue[i].src_mip_addr,
+                              pending_queue[i].payload,
+                              pending_queue[i].payload_len, debug) == 0) {
+                // Success, remove from queue
+                pending_queue[i].valid = 0;
+                if (debug) {
+                    printf("Sent pending packet to MIP %d\n", mip_addr);
+                }
+            }
+        }
+    }
 }
 
 // Add entry to ARP cache
@@ -158,8 +212,12 @@ static int create_raw_socket(const char *if_name) {
     return sd;
 }
 
+// Forward declaration
+static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr, uint8_t src_mip_addr,
+                          const char* payload, int payload_len, int debug);
+
 // Send MIP-ARP request
-static void send_arp_request(int raw_sock, uint8_t target_mip_addr, int debug) {
+static void send_arp_request(int raw_sock, uint8_t target_mip_addr, uint8_t my_mip_addr, int debug) {
     struct ethhdr eth_hdr;
     struct mip_header mip_hdr;
     uint8_t frame[ETH_FRAME_LEN];
@@ -178,7 +236,7 @@ static void send_arp_request(int raw_sock, uint8_t target_mip_addr, int debug) {
     // MIP header for ARP request
     memset(&mip_hdr, 0, sizeof(mip_hdr));
     mip_hdr.dst_addr = 0;  // Broadcast
-    mip_hdr.src_addr = 0;  // Will be set by receiving end
+    mip_hdr.src_addr = my_mip_addr;  // Set our MIP address
     mip_hdr.ttl = MIP_TTL;
     mip_hdr.sdu_len = 1;  // Just the target MIP address
     mip_hdr.msg_type = 1;  // ARP request
@@ -273,7 +331,7 @@ static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr, uint8_t src_mip_a
             if (debug) {
                 printf("No ARP entry for MIP address %d, sending ARP request\n", dst_mip_addr);
             }
-            send_arp_request(raw_sock, dst_mip_addr, debug);
+            send_arp_request(raw_sock, dst_mip_addr, src_mip_addr, debug);
             return -2;  // Cannot send now, need to wait for ARP response
         }
     }
@@ -322,7 +380,7 @@ static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr, uint8_t src_mip_a
 }
 
 // Handle incoming raw socket data
-static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug) {
+static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug, int raw_sock) {
     uint8_t frame[ETH_FRAME_LEN];
     struct ethhdr *eth_hdr;
     struct mip_header *mip_hdr;
@@ -360,11 +418,12 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug) {
                mip_hdr->sdu_len, mip_hdr->msg_type);
     }
 
-    // Add sender to ARP cache
-    add_arp_entry(mip_hdr->src_addr, eth_hdr->h_source);
-    
-    if (debug) {
-        print_arp_cache();
+    // Add sender to ARP cache (only if not broadcast)
+    if (mip_hdr->src_addr != 0) {
+        add_arp_entry(mip_hdr->src_addr, eth_hdr->h_source);
+        if (debug) {
+            print_arp_cache();
+        }
     }
 
     // Handle different message types
@@ -384,7 +443,7 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug) {
                            mip_hdr->src_addr, payload_len, payload);
                 }
                 
-                // Send to all connected clients (simplified)
+                // Send to all connected clients
                 for (int i = 0; i < num_clients; i++) {
                     if (clients[i].active) {
                         write(clients[i].fd, msg, 1 + payload_len);
@@ -395,8 +454,8 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug) {
             
         case 1: // ARP request
             if (debug) {
-                printf("Received ARP request for MIP address %d\n", 
-                       frame[sizeof(struct ethhdr) + sizeof(struct mip_header)]);
+                uint8_t target_addr = frame[sizeof(struct ethhdr) + sizeof(struct mip_header)];
+                printf("Received ARP request for MIP address %d\n", target_addr);
             }
             
             // Check if the request is for our MIP address
@@ -410,6 +469,8 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug) {
                 printf("Received ARP response from MIP address %d\n", mip_hdr->src_addr);
             }
             // Entry already added to cache above
+            // Now process any pending packets for this address
+            process_pending_packets(raw_sock, mip_hdr->src_addr, debug);
             break;
     }
 }
@@ -532,7 +593,7 @@ static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
         char* message = buf + 1;
         int msg_len = rc - 1;
 
-        // Check if destination is ourselves first (before trying to send over network)
+        // Check if destination is ourselves first
         if (dest_addr == my_mip_addr) {
             if (debug) {
                 printf("Destination is local, processing directly\n");
@@ -552,37 +613,19 @@ static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
                 }
             }
         } else {
-            // Send via network to remote host with retry for ARP
-            int attempts = 0;
-            int max_attempts = 5;
+            // Send via network to remote host
+            int result = send_mip_packet(raw_sock, dest_addr, my_mip_addr,
+                                        message, msg_len, debug);
             
-            while (attempts < max_attempts) {
-                int result = send_mip_packet(raw_sock, dest_addr, my_mip_addr,
-                                            message, msg_len, debug);
-                
-                if (result == 0) {
-                    // Success
-                    break;
-                } else if (result == -2) {
-                    // Waiting for ARP
-                    if (debug) {
-                        printf("Waiting for ARP resolution, attempt %d/%d\n", 
-                               attempts + 1, max_attempts);
-                    }
-                    usleep(500000);  // Wait 0.5 seconds
-                    attempts++;
-                } else {
-                    // Other error
-                    if (debug) {
-                        printf("Send error, stopping retry\n");
-                    }
-                    break;
-                }
-            }
-            
-            if (attempts == max_attempts) {
+            if (result == -2) {
+                // Waiting for ARP - add to pending queue
                 if (debug) {
-                    printf("Failed to send packet after %d attempts\n", max_attempts);
+                    printf("Adding packet to pending queue for MIP %d\n", dest_addr);
+                }
+                add_pending_packet(dest_addr, my_mip_addr, message, msg_len);
+            } else if (result != 0) {
+                if (debug) {
+                    printf("Failed to send packet\n");
                 }
             }
         }
@@ -602,6 +645,7 @@ void run_daemon(int raw_sock, int unix_sock, uint8_t mip_addr, int debug) {
     }
 
     init_arp_cache();
+    init_pending_queue();
     
     // Add our own address to ARP cache
     add_arp_entry(mip_addr, local_interface.mac_addr);
@@ -634,7 +678,7 @@ void run_daemon(int raw_sock, int unix_sock, uint8_t mip_addr, int debug) {
 
         for (i = 0; i < nfds; i++) {
             if (events[i].data.fd == raw_sock) {
-                handle_raw_socket(events[i].data.fd, mip_addr, debug);
+                handle_raw_socket(events[i].data.fd, mip_addr, debug, raw_sock);
             } else {
                 handle_unix_socket(events[i].data.fd, unix_sock, raw_sock, 
                                  mip_addr, debug, epollfd);
