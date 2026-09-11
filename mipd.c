@@ -200,7 +200,7 @@ static int discover_interfaces(void) {
 
   num_local_interfaces = 0;
 
-  for (ifa = ifaddrs; ifa != NULL; ifa->ifa_next) {
+  for (ifa = ifaddrs; ifa != NULL; ifa = ifa->ifa_next) {
     const struct sockaddr_ll *link_addr;
     struct interface_info *iface;
 
