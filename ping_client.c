@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +11,7 @@
 
 #include "mip.h"
 
-static int timeout_flag = 0;
+static volatile sig_atomic_t timeout_flag = 0;
 
 static void timeout_handler(int sig) {
   (void)sig; // Suppress unused parameter warning
@@ -45,10 +46,11 @@ static int connect_to_daemon(const char *socket_path) {
 void run_ping_client(const char *socket_path, const char *message,
                      uint8_t dest_addr) {
   int sock_fd, rc;
-  char send_buf[256], recv_buf[256];
-  char ping_msg[256];
+  char send_buf[257], recv_buf[257];
+  char ping_msg[256], expected_reply[256];
   struct timeval start, end;
   double response_time;
+  struct sigaction sa;
 
   sock_fd = connect_to_daemon(socket_path);
   if (sock_fd < 0) {
@@ -57,18 +59,29 @@ void run_ping_client(const char *socket_path, const char *message,
 
   // BUILD PING MESSAGE: DESTINATION ADDRESS + PING:MESSAGE
   snprintf(ping_msg, sizeof(ping_msg), "PING:%s", message);
+  snprintf(expected_reply, sizeof(expected_reply), "PONG:%s", message);
 
   // MESSAGE FORMAT: 1 byte dest addr + payload
   send_buf[0] = dest_addr;
   strcpy(send_buf + 1, ping_msg);
 
   // SET UP TIMEOUT
-  signal(SIGALRM, timeout_handler);
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = timeout_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+
+  if (sigaction(SIGALRM, &sa, NULL) == -1) {
+    perror("sigaction");
+    close(sock_fd);
+    exit(EXIT_FAILURE);
+  }
+
   timeout_flag = 0;
 
   // SEND PING
   gettimeofday(&start, NULL);
-  alarm(5);
+  alarm(1);
 
   rc = write(sock_fd, send_buf, 1 + strlen(ping_msg));
   if (rc < 0) {
@@ -77,21 +90,33 @@ void run_ping_client(const char *socket_path, const char *message,
     exit(EXIT_FAILURE);
   }
 
-  // WAIT FOR RESPONSE
-  rc = read(sock_fd, recv_buf, sizeof(recv_buf));
+  // Wait for the matching PONG reply
+  for (;;) {
+    rc = read(sock_fd, recv_buf, sizeof(recv_buf) - 1);
+
+    if (rc < 0 && errno == EINTR) {
+      if (timeout_flag) {
+        printf("timeout\n");
+        close(sock_fd);
+        return;
+      }
+      continue;
+    }
+
+    if (rc <= 0) {
+      perror("read");
+      close(sock_fd);
+      return;
+    }
+
+    recv_buf[rc] = '\0';
+
+    if (strcmp(recv_buf + 1, expected_reply) == 0) {
+      break;
+    }
+  }
+
   alarm(0);
-
-  if (timeout_flag) {
-    printf("TIMEOUT\n");
-    close(sock_fd);
-    exit(EXIT_FAILURE);
-  }
-
-  if (rc <= 0) {
-    perror("read");
-    close(sock_fd);
-    exit(EXIT_FAILURE);
-  }
 
   gettimeofday(&end, NULL);
 

@@ -34,8 +34,8 @@ static int connect_to_daemon(const char *socket_path) {
 
 void run_ping_server(const char *socket_path) {
   int sockfd, rc;
-  char buf[256];
-  char response[256];
+  char buf[257];
+  char response[257];
 
   sockfd = connect_to_daemon(socket_path);
   if (sockfd < 0) {
@@ -60,7 +60,7 @@ void run_ping_server(const char *socket_path) {
     uint8_t src_addr = buf[0];
     char *payload = buf + 1;
 
-    printf("Recieved %s\n", payload);
+    printf("Received %s\n", payload);
 
     // CHECK IF IT'S A PING MESSAGE
     if (strncmp(payload, "PING:", 5) == 0) {
