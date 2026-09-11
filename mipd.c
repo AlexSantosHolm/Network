@@ -1,7 +1,9 @@
 #include <stddef.h>
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <errno.h>
 #include <getopt.h>
+#include <ifaddrs.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
@@ -22,6 +24,7 @@
 struct arp_cache_entry {
   uint8_t mip_addr;
   uint8_t mac_addr[6];
+  int ifindex;
   time_t timestamp;
   int valid;
 };
@@ -42,6 +45,8 @@ struct pending_packet {
 
 // Pending packets waiting for ARP resolution
 #define PENDING_QUEUE_SIZE 32
+#define MAX_INTERFACES 16
+
 static struct pending_packet pending_queue[PENDING_QUEUE_SIZE];
 
 // Network interface info
@@ -51,7 +56,8 @@ struct interface_info {
   int ifindex;
 };
 
-static struct interface_info local_interface;
+static struct interface_info local_interfaces[MAX_INTERFACES];
+static size_t num_local_interfaces;
 
 static uint32_t make_arp_sdu(int is_response, uint8_t mip_addr) {
   uint32_t val =
@@ -129,28 +135,32 @@ static void process_pending_packets(int raw_sock, uint8_t mip_addr, int debug) {
 }
 
 // Add entry to ARP cache
-static void add_arp_entry(uint8_t mip_addr, uint8_t mac_addr[6]) {
+static void add_arp_entry(uint8_t mip_addr, const uint8_t mac_addr[ETH_ALEN],
+                          int ifindex) {
   int index = mip_addr % ARP_CACHE_SIZE;
 
   arp_cache[index].mip_addr = mip_addr;
-  memcpy(arp_cache[index].mac_addr, mac_addr, 6);
+  memcpy(arp_cache[index].mac_addr, mac_addr, ETH_ALEN);
+  arp_cache[index].ifindex = ifindex;
   arp_cache[index].timestamp = time(NULL);
   arp_cache[index].valid = 1;
 }
 
 // Find MAC address in ARP cache
-static int find_arp_entry(uint8_t mip_addr, uint8_t mac_addr[6]) {
+static int find_arp_entry(uint8_t mip_addr, uint8_t mac_addr[ETH_ALEN],
+                          int *ifindex) {
   int index = mip_addr % ARP_CACHE_SIZE;
 
   if (arp_cache[index].valid && arp_cache[index].mip_addr == mip_addr) {
-    // Check if entry is not too old (300 seconds = 5 minutes)
     if (time(NULL) - arp_cache[index].timestamp < 300) {
-      memcpy(mac_addr, arp_cache[index].mac_addr, 6);
+      memcpy(mac_addr, arp_cache[index].mac_addr, ETH_ALEN);
+      *ifindex = arp_cache[index].ifindex;
       return 1;
-    } else {
-      arp_cache[index].valid = 0;
     }
+
+    arp_cache[index].valid = 0;
   }
+
   return 0;
 }
 
@@ -159,75 +169,87 @@ static void print_arp_cache(void) {
   printf("=== MIP-ARP Cache ===\n");
   for (int i = 0; i < ARP_CACHE_SIZE; i++) {
     if (arp_cache[i].valid) {
-      printf("MIP %d -> MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+      printf("MIP %d -> MAC %02x:%02x:%02x:%02x:%02x:%02x on ifindex %d\n",
              arp_cache[i].mip_addr, arp_cache[i].mac_addr[0],
              arp_cache[i].mac_addr[1], arp_cache[i].mac_addr[2],
              arp_cache[i].mac_addr[3], arp_cache[i].mac_addr[4],
-             arp_cache[i].mac_addr[5]);
+             arp_cache[i].mac_addr[5], arp_cache[i].ifindex);
     }
   }
   printf("==================\n");
 }
 
-// Get interface information
-static int get_interface_info(const char *if_name) {
-  struct ifreq ifr;
-  int sockfd;
+static const struct interface_info *find_local_interface(int ifindex) {
+  for (size_t i = 0; i < num_local_interfaces; i++) {
+    if (local_interfaces[i].ifindex == ifindex) {
+      return &local_interfaces[i];
+    }
+  }
 
-  sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sockfd < 0) {
-    perror("socket");
+  return NULL;
+}
+
+static int discover_interfaces(void) {
+  struct ifaddrs *ifaddrs;
+  struct ifaddrs *ifa;
+
+  if (getifaddrs(&ifaddrs) == -1) {
+    perror("getifaddrs");
     return -1;
   }
 
-  // Get interface index
-  strncpy(ifr.ifr_name, if_name, IFNAMSIZ);
-  if (ioctl(sockfd, SIOCGIFINDEX, &ifr) < 0) {
-    perror("SIOCGIFINDEX");
-    close(sockfd);
+  num_local_interfaces = 0;
+
+  for (ifa = ifaddrs; ifa != NULL; ifa->ifa_next) {
+    const struct sockaddr_ll *link_addr;
+    struct interface_info *iface;
+
+    if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_PACKET ||
+        !(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) {
+      continue;
+    }
+
+    link_addr = (const struct sockaddr_ll *)ifa->ifa_addr;
+
+    if (link_addr->sll_halen != ETH_ALEN ||
+        find_local_interface(link_addr->sll_ifindex) != NULL) {
+      continue;
+    }
+
+    if (num_local_interfaces == MAX_INTERFACES) {
+      freeifaddrs(ifaddrs);
+      fprintf(stderr, "Too many Ethernet interfaces\n");
+      return -1;
+    }
+
+    iface = &local_interfaces[num_local_interfaces++];
+    memset(iface, 0, sizeof(*iface));
+
+    strncpy(iface->name, ifa->ifa_name, IFNAMSIZ - 1);
+    memcpy(iface->mac_addr, link_addr->sll_addr, ETH_ALEN);
+    iface->ifindex = link_addr->sll_ifindex;
+  }
+
+  freeifaddrs(ifaddrs);
+
+  if (num_local_interfaces == 0) {
+    fprintf(stderr, "No active Ethernet interfaces found\n");
     return -1;
   }
-  local_interface.ifindex = ifr.ifr_ifindex;
 
-  // Get MAC address
-  if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) < 0) {
-    perror("SIOCGIFHWADDR");
-    close(sockfd);
-    return -1;
-  }
-  memcpy(local_interface.mac_addr, ifr.ifr_hwaddr.sa_data, 6);
-  strncpy(local_interface.name, if_name, IFNAMSIZ);
-
-  close(sockfd);
   return 0;
 }
 
-// Create and bind raw socket to interface
-static int create_raw_socket(const char *if_name) {
+static int create_raw_socket(void) {
   int sd;
-  struct sockaddr_ll addr;
+
+  if (discover_interfaces() < 0) {
+    return -1;
+  }
 
   sd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_MIP));
   if (sd == -1) {
-    perror("raw_socket, AF_PACKET");
-    return -1;
-  }
-
-  // Get interface info
-  if (get_interface_info(if_name) < 0) {
-    close(sd);
-    return -1;
-  }
-
-  // Bind to specific interface
-  memset(&addr, 0, sizeof(addr));
-  addr.sll_family = AF_PACKET;
-  addr.sll_protocol = htons(ETH_P_MIP);
-  addr.sll_ifindex = local_interface.ifindex;
-
-  if (bind(sd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("bind raw socket");
-    close(sd);
+    perror("raw sock, AF_PACKET");
     return -1;
   }
 
@@ -237,93 +259,86 @@ static int create_raw_socket(const char *if_name) {
 // Send MIP-ARP request
 static void send_arp_request(int raw_sock, uint8_t target_mip_addr,
                              uint8_t my_mip_addr, int debug) {
-  struct ethhdr eth_hdr;
   struct mip_header mip_hdr;
-  uint8_t frame[ETH_FRAME_LEN];
-  int frame_len = 0;
-  struct sockaddr_ll addr;
   uint32_t arp_sdu;
 
   if (debug) {
     printf("Sending MIP-ARP request for MIP address %d\n", target_mip_addr);
   }
 
-  // Ethernet header - broadcast
-  memset(eth_hdr.h_dest, 0xFF, 6); // Broadcast
-  memcpy(eth_hdr.h_source, local_interface.mac_addr, 6);
-  eth_hdr.h_proto = htons(ETH_P_MIP);
-
-  // MIP header and one-word MIP-ARP request SDU
-  memset(&mip_hdr, 0, sizeof(mip_hdr));
-  mip_header_set(&mip_hdr, MIP_BROADCAST, my_mip_addr, MIP_TTL, 1,
-                 MIP_SDU_TYPE_ARP);
+  mip_header_set(&mip_hdr, MIP_BROADCAST, my_mip_addr, 1, 1, MIP_SDU_TYPE_ARP);
   arp_sdu = make_arp_sdu(0, target_mip_addr);
 
-  // Build frame
-  memcpy(frame, &eth_hdr, sizeof(eth_hdr));
-  frame_len += sizeof(eth_hdr);
-  memcpy(frame + frame_len, &mip_hdr, sizeof(mip_hdr));
-  frame_len += sizeof(mip_hdr);
-  memcpy(frame + frame_len, &arp_sdu, sizeof(arp_sdu));
-  frame_len += sizeof(arp_sdu);
+  for (size_t i = 0; i < num_local_interfaces; i++) {
+    const struct interface_info *iface = &local_interfaces[i];
+    struct ethhdr eth_hdr;
+    struct sockaddr_ll addr;
+    uint8_t frame[ETH_FRAME_LEN];
+    int frame_len = 0;
 
-  // Send frame
-  memset(&addr, 0, sizeof(addr));
-  addr.sll_family = AF_PACKET;
-  addr.sll_protocol = htons(ETH_P_MIP);
-  addr.sll_ifindex = local_interface.ifindex;
-  memset(addr.sll_addr, 0xFF, 6); // Broadcast
-  addr.sll_halen = 6;
+    memset(eth_hdr.h_dest, 0xff, ETH_ALEN);
+    memcpy(eth_hdr.h_source, iface->mac_addr, ETH_ALEN);
+    eth_hdr.h_proto = htons(ETH_P_MIP);
 
-  if (sendto(raw_sock, frame, frame_len, 0, (struct sockaddr *)&addr,
-             sizeof(addr)) < 0) {
-    perror("sendto ARP request");
+    memcpy(frame + frame_len, &eth_hdr, sizeof(eth_hdr));
+    frame_len += sizeof(eth_hdr);
+    memcpy(frame + frame_len, &mip_hdr, sizeof(mip_hdr));
+    frame_len += sizeof(mip_hdr);
+    memcpy(frame + frame_len, &arp_sdu, sizeof(arp_sdu));
+    frame_len += sizeof(arp_sdu);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sll_family = AF_PACKET;
+    addr.sll_protocol = htons(ETH_P_MIP);
+    addr.sll_ifindex = iface->ifindex;
+    memset(addr.sll_addr, 0xff, ETH_ALEN);
+    addr.sll_halen = ETH_ALEN;
+
+    if (sendto(raw_sock, frame, frame_len, 0, (struct sockaddr *)&addr,
+               sizeof(addr)) < 0) {
+      perror("sendto ARP request");
+    }
   }
 }
 
 // Send MIP-ARP response
-static void send_arp_response(int raw_sock, uint8_t target_mac[6],
+static void send_arp_response(int raw_sock, const struct interface_info *iface,
+                              const uint8_t target_mac[ETH_ALEN],
                               uint8_t target_mip_addr, uint8_t my_mip_addr,
                               int debug) {
   struct ethhdr eth_hdr;
   struct mip_header mip_hdr;
-  uint8_t frame[ETH_FRAME_LEN];
-  int frame_len = 0;
   struct sockaddr_ll addr;
+  uint8_t frame[ETH_FRAME_LEN];
   uint32_t arp_sdu;
+  int frame_len = 0;
 
   if (debug) {
-    printf("Sending MIP-ARP response to MIP address %d\n", target_mip_addr);
+    printf("Sending MIP-ARP response to MIP address %d on %s\n",
+           target_mip_addr, iface->name);
   }
 
-  // Ethernet header - unicast to requester
-  memcpy(eth_hdr.h_dest, target_mac, 6);
-  memcpy(eth_hdr.h_source, local_interface.mac_addr, 6);
+  memcpy(eth_hdr.h_dest, target_mac, ETH_ALEN);
+  memcpy(eth_hdr.h_source, iface->mac_addr, ETH_ALEN);
   eth_hdr.h_proto = htons(ETH_P_MIP);
-
-  // MIP header and one-word MIP-ARP response SDU
-  memset(&mip_hdr, 0, sizeof(mip_hdr));
 
   mip_header_set(&mip_hdr, target_mip_addr, my_mip_addr, MIP_TTL, 1,
                  MIP_SDU_TYPE_ARP);
-
   arp_sdu = make_arp_sdu(1, my_mip_addr);
 
-  // Build frame
-  memcpy(frame, &eth_hdr, sizeof(eth_hdr));
+  memcpy(frame + frame_len, &eth_hdr, sizeof(eth_hdr));
   frame_len += sizeof(eth_hdr);
   memcpy(frame + frame_len, &mip_hdr, sizeof(mip_hdr));
   frame_len += sizeof(mip_hdr);
   memcpy(frame + frame_len, &arp_sdu, sizeof(arp_sdu));
   frame_len += sizeof(arp_sdu);
 
-  // Send frame
   memset(&addr, 0, sizeof(addr));
   addr.sll_family = AF_PACKET;
   addr.sll_protocol = htons(ETH_P_MIP);
-  addr.sll_ifindex = local_interface.ifindex;
-  memcpy(addr.sll_addr, target_mac, 6);
-  addr.sll_halen = 6;
+  addr.sll_ifindex = iface->ifindex;
+  memcpy(addr.sll_addr, target_mac, ETH_ALEN);
+  addr.sll_halen = ETH_ALEN;
 
   if (sendto(raw_sock, frame, frame_len, 0, (struct sockaddr *)&addr,
              sizeof(addr)) < 0) {
@@ -335,65 +350,106 @@ static void send_arp_response(int raw_sock, uint8_t target_mac[6],
 static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr,
                            uint8_t src_mip_addr, const char *payload,
                            int payload_len, int debug) {
-  uint8_t dst_mac[6];
-  struct ethhdr eth_hdr;
   struct mip_header mip_hdr;
-  uint8_t frame[ETH_FRAME_LEN];
-  int frame_len = 0;
-  struct sockaddr_ll addr;
-  int padded_len;
   uint16_t sdu_words;
 
-  // Special case: if destination is ourselves, use our own MAC
-  padded_len = (payload_len + 3) & ~3;
-  sdu_words = padded_len / 4;
-  if (dst_mip_addr == src_mip_addr) {
-    memcpy(dst_mac, local_interface.mac_addr, 6);
+  if (payload_len % 4 != 0) {
     if (debug) {
-      printf("Sending to self, using local MAC address\n");
+      printf("Refusing unaligned SDU\n");
     }
-  } else {
-    // Look up destination MAC address
-    if (!find_arp_entry(dst_mip_addr, dst_mac)) {
-      if (debug) {
-        printf("No ARP entry for MIP address %d, sending ARP request\n",
-               dst_mip_addr);
-      }
-      send_arp_request(raw_sock, dst_mip_addr, src_mip_addr, debug);
-      return -2; // Cannot send now, need to wait for ARP response
-    }
+    return -1;
   }
+
+  sdu_words = payload_len / 4;
+
+  mip_header_set(&mip_hdr, dst_mip_addr, src_mip_addr,
+                 dst_mip_addr == MIP_BROADCAST ? 1 : MIP_TTL, sdu_words,
+                 MIP_SDU_TYPE_PING);
 
   if (debug) {
     printf("Sending MIP packet: %d -> %d, payload: %.*s\n", src_mip_addr,
            dst_mip_addr, payload_len, payload);
   }
 
-  // Ethernet header
-  memcpy(eth_hdr.h_dest, dst_mac, 6);
-  memcpy(eth_hdr.h_source, local_interface.mac_addr, 6);
+  if (dst_mip_addr == MIP_BROADCAST) {
+    int result = 0;
+
+    for (size_t i = 0; i < num_local_interfaces; i++) {
+      const struct interface_info *iface = &local_interfaces[i];
+      struct ethhdr eth_hdr;
+      struct sockaddr_ll addr;
+      uint8_t frame[ETH_FRAME_LEN];
+      int frame_len = 0;
+
+      memset(eth_hdr.h_dest, 0xff, ETH_ALEN);
+      memcpy(eth_hdr.h_source, iface->mac_addr, ETH_ALEN);
+      eth_hdr.h_proto = htons(ETH_P_MIP);
+
+      memcpy(frame + frame_len, &eth_hdr, sizeof(eth_hdr));
+      frame_len += sizeof(eth_hdr);
+      memcpy(frame + frame_len, &mip_hdr, sizeof(mip_hdr));
+      frame_len += sizeof(mip_hdr);
+      memcpy(frame + frame_len, payload, payload_len);
+      frame_len += payload_len;
+
+      memset(&addr, 0, sizeof(addr));
+      addr.sll_family = AF_PACKET;
+      addr.sll_protocol = htons(ETH_P_MIP);
+      addr.sll_ifindex = iface->ifindex;
+      memset(addr.sll_addr, 0xff, ETH_ALEN);
+      addr.sll_halen = ETH_ALEN;
+
+      if (sendto(raw_sock, frame, frame_len, 0, (struct sockaddr *)&addr,
+                 sizeof(addr)) < 0) {
+        perror("sendto broadcast MIP packet");
+        result = -1;
+      }
+    }
+
+    return result;
+  }
+
+  uint8_t dst_mac[ETH_ALEN];
+  int out_ifindex;
+  const struct interface_info *iface;
+  struct ethhdr eth_hdr;
+  struct sockaddr_ll addr;
+  uint8_t frame[ETH_FRAME_LEN];
+  int frame_len = 0;
+
+  if (!find_arp_entry(dst_mip_addr, dst_mac, &out_ifindex)) {
+    if (debug) {
+      printf("No ARP entry for MIP address %d, sending ARP request\n",
+             dst_mip_addr);
+    }
+
+    send_arp_request(raw_sock, dst_mip_addr, src_mip_addr, debug);
+    return -2;
+  }
+
+  iface = find_local_interface(out_ifindex);
+  if (iface == NULL) {
+    fprintf(stderr, "ARP cache references unknown interface\n");
+    return -1;
+  }
+
+  memcpy(eth_hdr.h_dest, dst_mac, ETH_ALEN);
+  memcpy(eth_hdr.h_source, iface->mac_addr, ETH_ALEN);
   eth_hdr.h_proto = htons(ETH_P_MIP);
 
-  // MIP header
-  mip_header_set(&mip_hdr, dst_mip_addr, src_mip_addr, MIP_TTL, sdu_words,
-                 MIP_SDU_TYPE_PING);
-
-  // Build frame
-  memcpy(frame, &eth_hdr, sizeof(eth_hdr));
+  memcpy(frame + frame_len, &eth_hdr, sizeof(eth_hdr));
   frame_len += sizeof(eth_hdr);
   memcpy(frame + frame_len, &mip_hdr, sizeof(mip_hdr));
   frame_len += sizeof(mip_hdr);
   memcpy(frame + frame_len, payload, payload_len);
-  memset(frame + frame_len + payload_len, 0, padded_len - payload_len);
-  frame_len += padded_len;
+  frame_len += payload_len;
 
-  // Send frame
   memset(&addr, 0, sizeof(addr));
   addr.sll_family = AF_PACKET;
   addr.sll_protocol = htons(ETH_P_MIP);
-  addr.sll_ifindex = local_interface.ifindex;
-  memcpy(addr.sll_addr, dst_mac, 6);
-  addr.sll_halen = 6;
+  addr.sll_ifindex = iface->ifindex;
+  memcpy(addr.sll_addr, dst_mac, ETH_ALEN);
+  addr.sll_halen = ETH_ALEN;
 
   if (sendto(raw_sock, frame, frame_len, 0, (struct sockaddr *)&addr,
              sizeof(addr)) < 0) {
@@ -415,6 +471,7 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
   socklen_t addr_len = sizeof(addr);
   size_t payload_len;
   uint8_t *payload;
+  const struct interface_info *incoming_iface;
 
   frame_len = recvfrom(fd, frame, sizeof(frame), 0, (struct sockaddr *)&addr,
                        &addr_len);
@@ -426,6 +483,15 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
   }
 
   if (frame_len < (int)(sizeof(struct ethhdr) + sizeof(struct mip_header))) {
+    return;
+  }
+
+  if (addr.sll_pkttype == PACKET_OUTGOING) {
+    return;
+  }
+
+  incoming_iface = find_local_interface(addr.sll_ifindex);
+  if (incoming_iface == NULL) {
     return;
   }
 
@@ -460,7 +526,8 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
 
   // Add sender to ARP cache (only if not broadcast)
   if (mip_hdr->src_addr != MIP_BROADCAST) {
-    add_arp_entry(mip_hdr->src_addr, eth_hdr->h_source);
+    add_arp_entry(mip_hdr->src_addr, eth_hdr->h_source,
+                  incoming_iface->ifindex);
     if (debug) {
       print_arp_cache();
     }
@@ -504,8 +571,8 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
       }
 
       if (arp_mip_addr == my_mip_addr) {
-        send_arp_response(raw_sock, eth_hdr->h_source, mip_hdr->src_addr,
-                          my_mip_addr, debug);
+        send_arp_response(raw_sock, incoming_iface, eth_hdr->h_source,
+                          mip_hdr->src_addr, my_mip_addr, debug);
       }
     } else {
       if (debug) {
@@ -597,7 +664,7 @@ static int add_to_epoll(int efd, struct epoll_event *ev, int fd) {
 
 static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
                                uint8_t my_mip_addr, int debug, int epollfd) {
-  char buf[256];
+  char buf[257];
   int rc, client_fd;
   struct epoll_event ev;
 
@@ -638,7 +705,8 @@ static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
 
     if (debug) {
       printf("Received from client %d: %d bytes\n", fd, rc);
-      printf("Dest addr: %d, Message: %s\n", (uint8_t)buf[0], buf + 1);
+      printf("Dest addr: %d, Message: %.*s\n", (uint8_t)buf[0], rc - 1,
+             buf + 1);
     }
 
     // Send via network layer
@@ -653,7 +721,7 @@ static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
       }
 
       // Forward directly to other local clients
-      char local_msg[256];
+      char local_msg[257];
       local_msg[0] = my_mip_addr; // Source address
       memcpy(local_msg + 1, message, msg_len);
 
@@ -691,22 +759,18 @@ void run_daemon(int raw_sock, int unix_sock, uint8_t mip_addr, int debug) {
 
   if (debug) {
     printf("MIP daemon starting at addr: %d\n", mip_addr);
-    printf("Local MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           local_interface.mac_addr[0], local_interface.mac_addr[1],
-           local_interface.mac_addr[2], local_interface.mac_addr[3],
-           local_interface.mac_addr[4], local_interface.mac_addr[5]);
+
+    for (size_t i = 0; i < num_local_interfaces; i++) {
+      const struct interface_info *iface = &local_interfaces[i];
+
+      printf("Interface %s: %02x:%02x:%02x:%02x:%02x:%02x\n", iface->name,
+             iface->mac_addr[0], iface->mac_addr[1], iface->mac_addr[2],
+             iface->mac_addr[3], iface->mac_addr[4], iface->mac_addr[5]);
+    }
   }
 
   init_arp_cache();
   init_pending_queue();
-
-  // Add our own address to ARP cache
-  add_arp_entry(mip_addr, local_interface.mac_addr);
-
-  if (debug) {
-    printf("Added self to ARP cache\n");
-    print_arp_cache();
-  }
 
   epollfd = epoll_create1(0);
   if (epollfd == -1) {
@@ -745,40 +809,42 @@ int main(int argc, char *argv[]) {
   int opt, debug = 0;
   int raw_sock, unix_sock;
   char *socket_path;
-  char *interface = "eth0"; // Default interface
+  char *endptr;
+  long parsed_addr;
   uint8_t mip_addr;
 
-  while ((opt = getopt(argc, argv, "hdi:")) != -1) {
+  while ((opt = getopt(argc, argv, "hd")) != -1) {
     switch (opt) {
     case 'h':
-      printf(
-          "Usage: %s [-h] [-d] [-i interface] <socket_upper> <MIP_address>\n",
-          argv[0]);
+      printf("Usage: %s [-h] [-d] <socket_upper> <MIP_address>\n", argv[0]);
       exit(EXIT_SUCCESS);
     case 'd':
       debug = 1;
       break;
-    case 'i':
-      interface = optarg;
-      break;
     default:
-      printf(
-          "Usage: %s [-h] [-d] [-i interface] <socket_upper> <MIP_address>\n",
-          argv[0]);
+      printf("Usage: %s [-h] [-d] <socket_upper> <MIP_address>\n", argv[0]);
       exit(EXIT_FAILURE);
     }
   }
 
   if (optind + 2 != argc) {
-    printf("Usage: %s [-h] [-d] [-i interface] <socket_upper> <MIP_address>\n",
-           argv[0]);
+    printf("Usage: %s [-h] [-d] <socket_upper> <MIP_address>\n", argv[0]);
     exit(EXIT_FAILURE);
   }
 
   socket_path = argv[optind];
-  mip_addr = atoi(argv[optind + 1]);
+  errno = 0;
+  parsed_addr = strtol(argv[optind + 1], &endptr, 10);
 
-  raw_sock = create_raw_socket(interface);
+  if (errno != 0 || *endptr != '\0' || parsed_addr < 0 ||
+      parsed_addr >= MIP_BROADCAST) {
+    fprintf(stderr, "MIP address must be between 0 and 254\n");
+    exit(EXIT_FAILURE);
+  }
+
+  mip_addr = (uint8_t)parsed_addr;
+
+  raw_sock = create_raw_socket();
   if (raw_sock == -1) {
     exit(EXIT_FAILURE);
   }

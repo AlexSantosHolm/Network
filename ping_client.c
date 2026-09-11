@@ -51,6 +51,8 @@ void run_ping_client(const char *socket_path, const char *message,
   struct timeval start, end;
   double response_time;
   struct sigaction sa;
+  size_t ping_len;
+  size_t padded_len;
 
   sock_fd = connect_to_daemon(socket_path);
   if (sock_fd < 0) {
@@ -61,9 +63,13 @@ void run_ping_client(const char *socket_path, const char *message,
   snprintf(ping_msg, sizeof(ping_msg), "PING:%s", message);
   snprintf(expected_reply, sizeof(expected_reply), "PONG:%s", message);
 
+  ping_len = strlen(ping_msg);
+  padded_len = (ping_len + 3) & ~(size_t)3;
+
   // MESSAGE FORMAT: 1 byte dest addr + payload
   send_buf[0] = dest_addr;
-  strcpy(send_buf + 1, ping_msg);
+  memcpy(send_buf + 1, ping_msg, ping_len);
+  memset(send_buf + 1 + ping_len, 0, padded_len - ping_len);
 
   // SET UP TIMEOUT
   memset(&sa, 0, sizeof(sa));
@@ -83,7 +89,7 @@ void run_ping_client(const char *socket_path, const char *message,
   gettimeofday(&start, NULL);
   alarm(1);
 
-  rc = write(sock_fd, send_buf, 1 + strlen(ping_msg));
+  rc = write(sock_fd, send_buf, 1 + padded_len);
   if (rc < 0) {
     perror("write");
     close(sock_fd);
@@ -135,6 +141,8 @@ void run_ping_client(const char *socket_path, const char *message,
 int main(int argc, char *argv[]) {
 
   int opt;
+  char *endptr;
+  long parsed_addr;
 
   while ((opt = getopt(argc, argv, "h")) != -1) {
     switch (opt) {
@@ -155,7 +163,16 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   }
 
-  run_ping_client(argv[optind], argv[optind + 1], atoi(argv[optind + 2]));
+  errno = 0;
+  parsed_addr = strtol(argv[optind + 2], &endptr, 10);
+
+  if (errno != 0 || *endptr != '\0' || parsed_addr < 0 ||
+      parsed_addr > MIP_BROADCAST) {
+    fprintf(stderr, "Destination address must be between 0 and 255\n");
+    exit(EXIT_FAILURE);
+  }
+
+  run_ping_client(argv[optind], argv[optind + 1], (uint8_t)parsed_addr);
 
   return 0;
 }

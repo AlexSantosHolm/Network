@@ -67,9 +67,15 @@ void run_ping_server(const char *socket_path) {
 
       // CREATE A PONG RESPONSE
       snprintf(response + 1, sizeof(response) - 1, "PONG:%s", payload + 5);
+      size_t response_len = strlen(response + 1);
+      size_t padded_len = (response_len + 3) & ~(size_t)3;
+
       response[0] = src_addr;
 
-      rc = write(sockfd, response, 1 + strlen(response + 1));
+      memset(response + 1 + response_len, 0, padded_len - response_len);
+
+      rc = write(sockfd, response, 1 + padded_len);
+
       if (rc < 0) {
         perror("write");
         break;
