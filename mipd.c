@@ -20,51 +20,72 @@
 
 #include "mip.h"
 
-// MIP-ARP cache entry
+/** One learned MIP-address-to-Ethernet-address mapping. */
 struct arp_cache_entry {
-  uint8_t mip_addr;
-  uint8_t mac_addr[6];
-  int ifindex;
-  time_t timestamp;
-  int valid;
+  uint8_t mip_addr;    /**< MIP address represented by this entry. */
+  uint8_t mac_addr[6]; /**< Destination Ethernet MAC address. */
+  int ifindex;         /**< Interface used to reach mac_addr. */
+  time_t timestamp;    /**< Time when the entry was last learned. */
+  int valid;           /**< Non-zero while this cache slot is usable. */
 };
 
-// ARP cache
+/** Number of direct-indexed MIP-ARP cache slots. */
 #define ARP_CACHE_SIZE 256
+/** Daemon-global MIP-ARP cache, indexed by MIP address. */
 static struct arp_cache_entry arp_cache[ARP_CACHE_SIZE];
 
-// Pending packet structure
+/** A packet retained until MIP-ARP resolves its destination address. */
 struct pending_packet {
-  uint8_t dst_mip_addr;
-  uint8_t src_mip_addr;
-  char payload[256];
-  int payload_len;
-  time_t timestamp;
-  int valid;
+  uint8_t dst_mip_addr; /**< MIP destination awaiting resolution. */
+  uint8_t src_mip_addr; /**< MIP source address for the eventual packet. */
+  char payload[256];    /**< Already padded upper-layer SDU. */
+  int payload_len;      /**< Size of payload in bytes. */
+  time_t timestamp;     /**< Time when the packet entered the queue. */
+  int valid;            /**< Non-zero while this slot contains a packet. */
 };
 
-// Pending packets waiting for ARP resolution
+/** Maximum number of packets waiting for MIP-ARP resolution. */
 #define PENDING_QUEUE_SIZE 32
+/** Maximum active Ethernet interfaces discovered for one daemon. */
 #define MAX_INTERFACES 16
 
+/** Daemon-global queue of packets waiting for a MIP-ARP response. */
 static struct pending_packet pending_queue[PENDING_QUEUE_SIZE];
 
-// Network interface info
+/** Ethernet information required to transmit on one local interface. */
 struct interface_info {
-  char name[IFNAMSIZ];
-  uint8_t mac_addr[6];
-  int ifindex;
+  char name[IFNAMSIZ]; /**< Kernel interface name, for example B-eth0. */
+  uint8_t mac_addr[6]; /**< Local Ethernet MAC address. */
+  int ifindex;         /**< Kernel interface index used by AF_PACKET. */
 };
 
+/** Discovered active non-loopback Ethernet interfaces. */
 static struct interface_info local_interfaces[MAX_INTERFACES];
+/** Number of valid entries currently stored in local_interfaces. */
 static size_t num_local_interfaces;
 
+/**
+ * Encode a four-byte MIP-ARP SDU.
+ *
+ * is_response is zero for a request and non-zero for a response. mip_addr is
+ * the MIP address being queried or advertised. The returned value is in
+ * network byte order and contains the response bit and address. No global
+ * variables are used and there are no error cases.
+ */
 static uint32_t make_arp_sdu(int is_response, uint8_t mip_addr) {
   uint32_t val =
       ((uint32_t)(is_response & 1) << 31) | ((uint32_t)mip_addr << 23);
   return htonl(val);
 }
 
+/**
+ * Decode a four-byte MIP-ARP SDU.
+ *
+ * data points to four bytes received from a MIP packet. is_response receives
+ * the request/response bit and mip_addr receives the encoded MIP address.
+ * The function returns nothing, uses no global variables, and assumes all
+ * pointers are valid and data contains a complete MIP-ARP SDU.
+ */
 static void read_arp_sdu(const uint8_t *data, int *is_response,
                          uint8_t *mip_addr) {
   uint32_t val;
@@ -76,30 +97,54 @@ static void read_arp_sdu(const uint8_t *data, int *is_response,
   *mip_addr = (val >> 23) & 0xff;
 }
 
-// Client tracking for upper layer
+/** One upper-layer application connected to the daemon's UNIX socket. */
 struct client_info {
-  int fd;
-  uint8_t mip_addr;
-  int active;
+  int fd;           /**< Connected UNIX SOCK_SEQPACKET descriptor. */
+  uint8_t mip_addr; /**< Local MIP address associated with the client. */
+  int active;       /**< Non-zero while the descriptor is connected. */
 };
 
+/** Daemon-global table of connected upper-layer clients. */
 static struct client_info clients[MAX_EVENTS];
+/** Number of currently occupied entries in clients. */
 static int num_clients = 0;
 
-// Forward declaration of send_mip_packet
+/**
+ * Send one padded MIP ping SDU, or begin MIP-ARP resolution if necessary.
+ *
+ * See the full definition below for parameter, return-value, and error
+ * details. This declaration is needed by process_pending_packets.
+ */
 static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr,
                            uint8_t src_mip_addr, const char *payload,
                            int payload_len, int debug);
 
-// Initialize ARP cache
+/**
+ * Clear every MIP-ARP cache entry.
+ *
+ * This function has no parameters or return value. It resets the global
+ * arp_cache before the daemon event loop starts. No error is possible.
+ */
 static void init_arp_cache(void) { memset(arp_cache, 0, sizeof(arp_cache)); }
 
-// Initialize pending queue
+/**
+ * Clear all pending-packet slots.
+ *
+ * This function has no parameters or return value. It resets the global
+ * pending_queue before packet processing begins. No error is possible.
+ */
 static void init_pending_queue(void) {
   memset(pending_queue, 0, sizeof(pending_queue));
 }
 
-// Add packet to pending queue
+/**
+ * Store a packet while its destination MIP address is being resolved.
+ *
+ * dst_mip_addr and src_mip_addr become the packet header addresses. payload
+ * points to payload_len already padded bytes copied into the global
+ * pending_queue. The function returns nothing and silently drops the packet
+ * when the queue is full; callers must ensure payload_len fits the buffer.
+ */
 static void add_pending_packet(uint8_t dst_mip_addr, uint8_t src_mip_addr,
                                const char *payload, int payload_len) {
   for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
@@ -115,7 +160,14 @@ static void add_pending_packet(uint8_t dst_mip_addr, uint8_t src_mip_addr,
   }
 }
 
-// Process pending packets for a specific destination
+/**
+ * Retry queued packets after learning a destination's MIP-ARP mapping.
+ *
+ * raw_sock is the AF_PACKET socket, mip_addr selects queued packets, and
+ * debug controls status output. The function reads and updates global
+ * pending_queue and uses the ARP/interface state indirectly through
+ * send_mip_packet. It returns nothing; unsuccessful retries remain queued.
+ */
 static void process_pending_packets(int raw_sock, uint8_t mip_addr, int debug) {
   for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
     if (pending_queue[i].valid && pending_queue[i].dst_mip_addr == mip_addr) {
@@ -134,7 +186,14 @@ static void process_pending_packets(int raw_sock, uint8_t mip_addr, int debug) {
   }
 }
 
-// Add entry to ARP cache
+/**
+ * Insert or refresh one MIP-ARP cache entry.
+ *
+ * mip_addr is the learned MIP address, mac_addr is its Ethernet MAC address,
+ * and ifindex is the local interface on which it was learned. The function
+ * updates the global arp_cache and returns nothing. It performs no pointer or
+ * interface validation because the packet receiver has already validated them.
+ */
 static void add_arp_entry(uint8_t mip_addr, const uint8_t mac_addr[ETH_ALEN],
                           int ifindex) {
   int index = mip_addr % ARP_CACHE_SIZE;
@@ -146,7 +205,14 @@ static void add_arp_entry(uint8_t mip_addr, const uint8_t mac_addr[ETH_ALEN],
   arp_cache[index].valid = 1;
 }
 
-// Find MAC address in ARP cache
+/**
+ * Look up a non-expired MIP-ARP mapping.
+ *
+ * mip_addr is the address sought. On success mac_addr receives its MAC and
+ * ifindex receives its outgoing interface. The function reads and may expire
+ * an entry in the global arp_cache. It returns 1 on a fresh match and 0 for a
+ * missing or expired entry; output parameters are untouched on failure.
+ */
 static int find_arp_entry(uint8_t mip_addr, uint8_t mac_addr[ETH_ALEN],
                           int *ifindex) {
   int index = mip_addr % ARP_CACHE_SIZE;
@@ -164,7 +230,13 @@ static int find_arp_entry(uint8_t mip_addr, uint8_t mac_addr[ETH_ALEN],
   return 0;
 }
 
-// Print ARP cache (for debugging)
+/**
+ * Print all valid MIP-ARP cache mappings to standard output.
+ *
+ * The function has no parameters or return value. It reads the global
+ * arp_cache and is called only when debug output is requested. No error is
+ * reported if the cache is empty.
+ */
 static void print_arp_cache(void) {
   printf("=== MIP-ARP Cache ===\n");
   for (int i = 0; i < ARP_CACHE_SIZE; i++) {
@@ -179,6 +251,14 @@ static void print_arp_cache(void) {
   printf("==================\n");
 }
 
+/**
+ * Find a previously discovered interface by kernel index.
+ *
+ * ifindex is the AF_PACKET interface index to search for. The function reads
+ * local_interfaces and num_local_interfaces and returns a pointer to the
+ * matching entry, or NULL when it is not one of this daemon's interfaces.
+ * The returned pointer remains valid until interface discovery runs again.
+ */
 static const struct interface_info *find_local_interface(int ifindex) {
   for (size_t i = 0; i < num_local_interfaces; i++) {
     if (local_interfaces[i].ifindex == ifindex) {
@@ -189,6 +269,14 @@ static const struct interface_info *find_local_interface(int ifindex) {
   return NULL;
 }
 
+/**
+ * Discover active local Ethernet interfaces for raw MIP communication.
+ *
+ * The function has no input parameters. It replaces the daemon-global
+ * local_interfaces table and num_local_interfaces with active, non-loopback
+ * AF_PACKET interfaces. It returns 0 on success and -1 when getifaddrs fails,
+ * too many interfaces are present, or no suitable interface exists.
+ */
 static int discover_interfaces(void) {
   struct ifaddrs *ifaddrs;
   struct ifaddrs *ifa;
@@ -240,6 +328,14 @@ static int discover_interfaces(void) {
   return 0;
 }
 
+/**
+ * Create the raw Ethernet socket used for MIP frames.
+ *
+ * The function has no input parameters. It first updates local_interfaces by
+ * calling discover_interfaces, then creates an AF_PACKET SOCK_RAW socket for
+ * ETH_P_MIP. It returns the open descriptor on success or -1 after reporting
+ * an interface-discovery or socket-creation error.
+ */
 static int create_raw_socket(void) {
   int sd;
 
@@ -256,7 +352,15 @@ static int create_raw_socket(void) {
   return sd;
 }
 
-// Send MIP-ARP request
+/**
+ * Broadcast a MIP-ARP request on every active Ethernet interface.
+ *
+ * raw_sock is the raw Ethernet socket, target_mip_addr is the address being
+ * resolved, my_mip_addr is the sender address, and debug enables logging.
+ * The function reads local_interfaces and num_local_interfaces, sends a
+ * broadcast MIP packet with TTL 1, and returns nothing. Individual sendto
+ * failures are printed but do not stop requests on later interfaces.
+ */
 static void send_arp_request(int raw_sock, uint8_t target_mip_addr,
                              uint8_t my_mip_addr, int debug) {
   struct mip_header mip_hdr;
@@ -301,7 +405,14 @@ static void send_arp_request(int raw_sock, uint8_t target_mip_addr,
   }
 }
 
-// Send MIP-ARP response
+/**
+ * Send a unicast MIP-ARP response on the interface that received the request.
+ *
+ * raw_sock is the raw Ethernet socket. iface identifies the outgoing local
+ * interface. target_mac and target_mip_addr identify the requester, while
+ * my_mip_addr is this host's address. debug enables status output. The
+ * function returns nothing and prints, rather than returns, a sendto error.
+ */
 static void send_arp_response(int raw_sock, const struct interface_info *iface,
                               const uint8_t target_mac[ETH_ALEN],
                               uint8_t target_mip_addr, uint8_t my_mip_addr,
@@ -346,7 +457,17 @@ static void send_arp_response(int raw_sock, const struct interface_info *iface,
   }
 }
 
-// Send MIP data packet
+/**
+ * Encapsulate and transmit a padded ping SDU in a MIP/Ethernet frame.
+ *
+ * raw_sock is the AF_PACKET socket. dst_mip_addr and src_mip_addr are the MIP
+ * header addresses. payload points to payload_len bytes, which must already
+ * be divisible by four. debug enables status output. The function reads the
+ * global ARP cache and local interface table; broadcast packets use every
+ * local interface. It returns 0 after transmission, -2 when it started
+ * MIP-ARP resolution, and -1 for an unaligned SDU, unknown cached interface,
+ * or send failure.
+ */
 static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr,
                            uint8_t src_mip_addr, const char *payload,
                            int payload_len, int debug) {
@@ -460,7 +581,15 @@ static int send_mip_packet(int raw_sock, uint8_t dst_mip_addr,
   return 0;
 }
 
-// Handle incoming raw socket data
+/**
+ * Receive, validate, and process one Ethernet frame carrying MIP.
+ *
+ * fd is the readable raw socket, my_mip_addr is this host's MIP address,
+ * debug enables logging, and raw_sock is used to send ARP responses or queued
+ * packets. The function updates global ARP and client state and may use the
+ * pending queue. It returns nothing, silently discarding malformed, outgoing,
+ * unrelated-interface, or unknown-type frames.
+ */
 static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
                               int raw_sock) {
   uint8_t frame[ETH_FRAME_LEN];
@@ -595,7 +724,14 @@ static void handle_raw_socket(int fd, uint8_t my_mip_addr, int debug,
   }
 }
 
-// Client management functions
+/**
+ * Register an upper-layer UNIX client.
+ *
+ * fd is the connected client descriptor and mip_addr is the daemon's local
+ * MIP address stored with that client. The function updates global clients
+ * and num_clients, returns nothing, and silently ignores a new client when
+ * MAX_EVENTS clients are already tracked.
+ */
 static void add_client(int fd, uint8_t mip_addr) {
   if (num_clients < MAX_EVENTS) {
     clients[num_clients].fd = fd;
@@ -605,6 +741,13 @@ static void add_client(int fd, uint8_t mip_addr) {
   }
 }
 
+/**
+ * Remove a disconnected upper-layer client from the client table.
+ *
+ * fd identifies the client descriptor to remove. The function updates global
+ * clients and num_clients, returns nothing, and does nothing if fd is absent.
+ * Closing the descriptor remains the caller's responsibility.
+ */
 static void remove_client(int fd) {
   for (int i = 0; i < num_clients; i++) {
     if (clients[i].fd == fd) {
@@ -618,6 +761,14 @@ static void remove_client(int fd) {
   }
 }
 
+/**
+ * Create, bind, and listen on the daemon's UNIX SOCK_SEQPACKET socket.
+ *
+ * socket_path is the filesystem pathname used as the upper-layer interface.
+ * Any stale socket at that path is unlinked before bind. The function returns
+ * a listening descriptor on success or -1 after reporting socket, bind, or
+ * listen failure. It does not use daemon-global state.
+ */
 static int create_unix_socket(const char *socket_path) {
   struct sockaddr_un addr;
   int sd, rc;
@@ -651,6 +802,13 @@ static int create_unix_socket(const char *socket_path) {
   return sd;
 }
 
+/**
+ * Register a descriptor for readable events in an epoll instance.
+ *
+ * efd is the epoll descriptor, ev is the event structure to initialise, and
+ * fd is the descriptor to monitor. The function returns 0 on success or -1
+ * after reporting an epoll_ctl error. It does not use global variables.
+ */
 static int add_to_epoll(int efd, struct epoll_event *ev, int fd) {
   ev->events = EPOLLIN;
   ev->data.fd = fd;
@@ -662,6 +820,16 @@ static int add_to_epoll(int efd, struct epoll_event *ev, int fd) {
   return 0;
 }
 
+/**
+ * Accept an upper-layer client or handle one message from an existing client.
+ *
+ * fd is the ready descriptor. unix_sock identifies the listening socket;
+ * raw_sock carries remote MIP packets; my_mip_addr is this host's address;
+ * debug enables logs; and epollfd manages client registrations. The function
+ * updates global clients and may update pending/ARP state through
+ * send_mip_packet. It returns nothing. It closes and removes clients on EOF
+ * or read failure and reports accept or epoll registration errors.
+ */
 static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
                                uint8_t my_mip_addr, int debug, int epollfd) {
   char buf[257];
@@ -753,6 +921,15 @@ static void handle_unix_socket(int fd, int unix_sock, int raw_sock,
   }
 }
 
+/**
+ * Run the daemon's epoll-based network and upper-layer event loop.
+ *
+ * raw_sock receives Ethernet MIP frames. unix_sock accepts local applications.
+ * mip_addr is this daemon's MIP address and debug enables console logs. The
+ * function initialises global arp_cache and pending_queue, reads the global
+ * interface/client state, and dispatches events until epoll_wait fails. It
+ * returns nothing; epoll setup failures terminate the process.
+ */
 void run_daemon(int raw_sock, int unix_sock, uint8_t mip_addr, int debug) {
   struct epoll_event ev, events[MAX_EVENTS];
   int epollfd, i, nfds;
@@ -805,6 +982,16 @@ void run_daemon(int raw_sock, int unix_sock, uint8_t mip_addr, int debug) {
   close(epollfd);
 }
 
+/**
+ * Parse daemon options, create sockets, and start the daemon.
+ *
+ * argc and argv contain `mipd [-h] [-d] <socket_upper> <MIP_address>`.
+ * -d enables debug logging and -h prints usage. The function validates that
+ * the MIP address is in 0..254, creates the raw and UNIX sockets, invokes
+ * run_daemon, then cleans up descriptors and the socket pathname. It returns
+ * EXIT_SUCCESS after normal shutdown and exits with EXIT_FAILURE for invalid
+ * input or socket setup errors. It affects no globals directly.
+ */
 int main(int argc, char *argv[]) {
   int opt, debug = 0;
   int raw_sock, unix_sock;

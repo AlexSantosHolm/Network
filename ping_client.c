@@ -11,13 +11,29 @@
 
 #include "mip.h"
 
+/** Set by timeout_handler when the one-second ping deadline expires. */
 static volatile sig_atomic_t timeout_flag = 0;
 
+/**
+ * Record expiry of the ping timeout alarm.
+ *
+ * sig is the delivered signal number and is intentionally unused. The signal
+ * handler sets the global timeout_flag using the signal-safe sig_atomic_t
+ * type. It returns nothing and performs no I/O or error handling.
+ */
 static void timeout_handler(int sig) {
   (void)sig; // Suppress unused parameter warning
   timeout_flag = 1;
 }
 
+/**
+ * Connect this application to the daemon's UNIX SOCK_SEQPACKET socket.
+ *
+ * socket_path is the daemon's bound filesystem socket path. The function
+ * returns a connected descriptor on success or -1 after reporting a socket or
+ * connect error. It uses no global variables and closes a partially created
+ * descriptor before returning failure.
+ */
 static int connect_to_daemon(const char *socket_path) {
 
   struct sockaddr_un addr;
@@ -43,6 +59,16 @@ static int connect_to_daemon(const char *socket_path) {
   return sd;
 }
 
+/**
+ * Send one ping request and print its matching reply or a timeout.
+ *
+ * socket_path names the daemon's UNIX socket, message is the unpadded user
+ * text, and dest_addr is the MIP destination. The function pads `PING:` plus
+ * message to a 32-bit boundary, waits at most one second for `PONG:` plus the
+ * same message, and prints the response time on success. It uses and resets
+ * the global timeout_flag. It returns nothing, exits on setup/write errors,
+ * prints `timeout` on alarm expiry, and returns early on read failure.
+ */
 void run_ping_client(const char *socket_path, const char *message,
                      uint8_t dest_addr) {
   int sock_fd, rc;
@@ -138,6 +164,15 @@ void run_ping_client(const char *socket_path, const char *message,
   close(sock_fd);
 }
 
+/**
+ * Parse ping-client arguments and run one ping exchange.
+ *
+ * argc and argv contain `ping_client [-h] <socket_lower> <message>
+ * <destination_host>`. The function converts and validates the destination
+ * address in 0..255, then passes the arguments to run_ping_client. It returns
+ * EXIT_SUCCESS after a normal client run and exits with EXIT_FAILURE for
+ * invalid arguments. It does not access global state directly.
+ */
 int main(int argc, char *argv[]) {
 
   int opt;
